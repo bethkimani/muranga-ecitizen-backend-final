@@ -130,7 +130,7 @@ SIMPLE_JWT = {
 # Trailing slashes are stripped automatically (they break corsheaders.E014).
 CORS_ALLOWED_ORIGINS = env_list(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:3000,http://127.0.0.1:3000,https://muranga-ecitizen-frontend-final.vercel.app/',
+    'https://muranga-ecitizen-frontend-final.vercel.app/',
 )
 CSRF_TRUSTED_ORIGINS = [o for o in CORS_ALLOWED_ORIGINS if o.startswith('https://')]
 _render_url = os.getenv('RENDER_EXTERNAL_URL')
@@ -167,7 +167,7 @@ if not DEBUG:
     SECURE_CONTENT_TYPE_NOSNIFF = True
 
 # CHANGED: Frontend address, used to build the verification and reset links in emails
-FRONTEND_URL = os.getenv('FRONTEND_URL', 'http://localhost:3000').rstrip('/')
+FRONTEND_URL = os.getenv('FRONTEND_URL', 'https://muranga-ecitizen-frontend-final.vercel.app/').rstrip('/')
 
 # CHANGED: Email. Prints to the terminal unless EMAIL_BACKEND is set to the SMTP backend.
 EMAIL_BACKEND = os.getenv('EMAIL_BACKEND', 'django.core.mail.backends.console.EmailBackend')
