@@ -1,3 +1,4 @@
+import base64
 import hashlib
 import hmac
 import html
@@ -6,6 +7,8 @@ import os
 import secrets
 import threading
 from datetime import timedelta
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 from urllib.parse import quote
 
 import requests
@@ -21,7 +24,7 @@ CODE_TTL = timedelta(minutes=getattr(settings, 'OTP_TTL_MINUTES', 15))
 RESEND_COOLDOWN = timedelta(seconds=60)
 MAX_ATTEMPTS = 5
 
-# Brevo can be slow on the first call; allow longer and retry once.
+# Email providers can be slow on the first call; allow longer and retry once.
 EMAIL_TIMEOUT_SECONDS = 20
 EMAIL_ATTEMPTS = 2
 
@@ -39,6 +42,21 @@ def _hash(user, purpose, code):
     return hashlib.sha256(raw.encode()).hexdigest()
 
 
+def _generate_code():
+    """
+    Return the 6-digit code.
+
+    If OTP_FIXED_CODE is set in the environment (exactly 6 digits), that code is used
+    for every user. This is for testing only. Remove the variable to go back to
+    random codes.
+    """
+    fixed = os.environ.get('OTP_FIXED_CODE', '').strip()
+    if len(fixed) == 6 and fixed.isdigit():
+        logger.warning('OTP_FIXED_CODE is active: every account uses the same code. Testing only.')
+        return fixed
+    return f'{secrets.randbelow(1_000_000):06d}'
+
+
 def issue_code(user, purpose, force=False):
     """Create a new 6-digit code. Returns the plain code, or None if the resend cooldown applies."""
     now = timezone.now()
@@ -53,7 +71,7 @@ def issue_code(user, purpose, force=False):
     # Only one active code at a time
     OneTimeCode.objects.filter(user=user, purpose=purpose, used=False).update(used=True)
 
-    code = f'{secrets.randbelow(1_000_000):06d}'
+    code = _generate_code()
     OneTimeCode.objects.create(user=user, purpose=purpose, code_hash=_hash(user, purpose, code))
     return code
 
@@ -133,48 +151,125 @@ def send_sms(phone, message):
         return False
 
 
-def send_email(to_email, subject, body, html_body=None):
-    """Send via Brevo's HTTPS API if configured, else fall back to Django's email backend."""
-    api_key = os.environ.get('BREVO_API_KEY', '')
-    sender = os.environ.get('BREVO_SENDER_EMAIL', '')
+def send_gmail_api(to_email, subject, body, html_body=None):
+    """
+    Send through the Gmail API (HTTPS, works on Render's free plan).
 
-    if api_key and sender:
-        payload = {
-            'sender': {'name': "Murang'a e-Citizen", 'email': sender},
-            'replyTo': {'name': "Murang'a e-Citizen", 'email': sender},
-            'to': [{'email': to_email}],
-            'subject': subject,
-            'textContent': body,
-        }
+    Needs these environment variables:
+      GMAIL_CLIENT_ID, GMAIL_CLIENT_SECRET, GMAIL_REFRESH_TOKEN, GMAIL_SENDER
+
+    Returns None if not configured, True if sent, False if it failed.
+    """
+    client_id = os.environ.get('GMAIL_CLIENT_ID', '')
+    client_secret = os.environ.get('GMAIL_CLIENT_SECRET', '')
+    refresh_token = os.environ.get('GMAIL_REFRESH_TOKEN', '')
+    sender = os.environ.get('GMAIL_SENDER', '')
+    if not (client_id and client_secret and refresh_token and sender):
+        return None
+
+    try:
+        tok = requests.post(
+            'https://oauth2.googleapis.com/token',
+            data={
+                'client_id': client_id,
+                'client_secret': client_secret,
+                'refresh_token': refresh_token,
+                'grant_type': 'refresh_token',
+            },
+            timeout=EMAIL_TIMEOUT_SECONDS,
+        )
+        if tok.status_code >= 400:
+            logger.error('Gmail token request failed (%s): %s', tok.status_code, tok.text)
+            return False
+        access_token = tok.json()['access_token']
+
+        msg = MIMEMultipart('alternative')
+        msg['To'] = to_email
+        msg['From'] = f"Murang'a e-Citizen <{sender}>"
+        msg['Subject'] = subject
+        msg.attach(MIMEText(body, 'plain', 'utf-8'))
         if html_body:
-            payload['htmlContent'] = html_body
+            msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+        raw = base64.urlsafe_b64encode(msg.as_bytes()).decode()
 
-        for attempt in range(1, EMAIL_ATTEMPTS + 1):
-            try:
-                r = requests.post(
-                    'https://api.brevo.com/v3/smtp/email',
-                    headers={
-                        'api-key': api_key,
-                        'accept': 'application/json',
-                        'content-type': 'application/json',
-                    },
-                    json=payload,
-                    timeout=EMAIL_TIMEOUT_SECONDS,
-                )
-                if r.status_code >= 400:
-                    # A rejection will not fix itself on retry
-                    logger.error('Brevo rejected the email (%s): %s', r.status_code, r.text)
-                    return False
-                return True
-            except (requests.Timeout, requests.ConnectionError):
-                logger.warning('Brevo email attempt %s/%s timed out or lost connection', attempt, EMAIL_ATTEMPTS)
-            except Exception:
-                logger.exception('Brevo email sending failed')
-                return False
-        logger.error('Brevo email failed after %s attempts', EMAIL_ATTEMPTS)
+        r = requests.post(
+            'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
+            headers={'Authorization': f'Bearer {access_token}'},
+            json={'raw': raw},
+            timeout=EMAIL_TIMEOUT_SECONDS,
+        )
+        if r.status_code >= 400:
+            logger.error('Gmail API rejected the email (%s): %s', r.status_code, r.text)
+            return False
+        logger.info('Gmail API sent email to %s', to_email)
+        return True
+    except Exception:
+        logger.exception('Gmail API sending failed')
         return False
 
-    # No Brevo config: use whatever EMAIL_BACKEND is set (console backend prints to logs)
+
+def _send_brevo(to_email, subject, body, html_body=None):
+    """Send via Brevo's HTTPS API. Returns None if not configured, True if accepted, False otherwise."""
+    api_key = os.environ.get('BREVO_API_KEY', '')
+    sender = os.environ.get('BREVO_SENDER_EMAIL', '')
+    if not (api_key and sender):
+        return None
+
+    payload = {
+        'sender': {'name': "Murang'a e-Citizen", 'email': sender},
+        'replyTo': {'name': "Murang'a e-Citizen", 'email': sender},
+        'to': [{'email': to_email}],
+        'subject': subject,
+        'textContent': body,
+    }
+    if html_body:
+        payload['htmlContent'] = html_body
+
+    for attempt in range(1, EMAIL_ATTEMPTS + 1):
+        try:
+            r = requests.post(
+                'https://api.brevo.com/v3/smtp/email',
+                headers={
+                    'api-key': api_key,
+                    'accept': 'application/json',
+                    'content-type': 'application/json',
+                },
+                json=payload,
+                timeout=EMAIL_TIMEOUT_SECONDS,
+            )
+            if r.status_code >= 400:
+                # A rejection will not fix itself on retry
+                logger.error('Brevo rejected the email (%s): %s', r.status_code, r.text)
+                return False
+            logger.info('Brevo accepted email to %s (%s)', to_email, r.status_code)
+            return True
+        except (requests.Timeout, requests.ConnectionError):
+            logger.warning('Brevo email attempt %s/%s timed out or lost connection', attempt, EMAIL_ATTEMPTS)
+        except Exception:
+            logger.exception('Brevo email sending failed')
+            return False
+
+    logger.error('Brevo email failed after %s attempts', EMAIL_ATTEMPTS)
+    return False
+
+
+def send_email(to_email, subject, body, html_body=None):
+    """
+    Try the Gmail API first (if configured), then Brevo (if configured),
+    then Django's email backend (console backend prints to the logs).
+    """
+    result = send_gmail_api(to_email, subject, body, html_body)
+    if result:
+        return True
+
+    result = _send_brevo(to_email, subject, body, html_body)
+    if result:
+        return True
+    if result is False:
+        # Brevo is configured but failed; do not fall through silently
+        return False
+
+    # Nothing configured: use whatever EMAIL_BACKEND is set
     try:
         send_mail(subject=subject, message=body, from_email=None, recipient_list=[to_email])
         return True
@@ -184,7 +279,7 @@ def send_email(to_email, subject, body, html_body=None):
 
 
 def _send_email_background(to_email, subject, body, html_body):
-    """Run send_email in a background thread so the request does not wait for Brevo."""
+    """Run send_email in a background thread so the request does not wait for the provider."""
 
     def _run():
         try:
@@ -221,6 +316,11 @@ def deliver(user, purpose, code):
 
     try:
         label = 'verify your account' if purpose == 'VERIFY' else 'reset your password'
+        subject = (
+            "Verify your Murang'a e-Citizen account"
+            if purpose == 'VERIFY'
+            else "Reset your Murang'a e-Citizen password"
+        )
         minutes = int(CODE_TTL.total_seconds() // 60)
 
         who = user.email or getattr(user, 'phone_number', '') or ''
@@ -240,7 +340,7 @@ def deliver(user, purpose, code):
     if email:
         _send_email_background(
             email,
-            f"Murang'a e-Citizen: your code is {code}",
+            subject,
             f'{text}\n\nOr open this link:\n{link}',
             html_body,
         )
