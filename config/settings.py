@@ -114,6 +114,8 @@ TEMPLATES = [
 ]
 
 # ---------------------------------------------------------------- Database
+# On Render, set DATABASE_URL to your Render Postgres connection string.
+# Without it Django falls back to SQLite, which is wiped on every deploy.
 DATABASES = {
     "default": dj_database_url.config(
         default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
@@ -137,6 +139,12 @@ REST_FRAMEWORK = {
         "rest_framework_simplejwt.authentication.JWTAuthentication",
     ),
 }
+# In production return JSON only (no browsable HTML API, which needs
+# collected static files and can itself cause 500s).
+if not DEBUG:
+    REST_FRAMEWORK["DEFAULT_RENDERER_CLASSES"] = (
+        "rest_framework.renderers.JSONRenderer",
+    )
 
 SIMPLE_JWT = {
     "ACCESS_TOKEN_LIFETIME": timedelta(minutes=60),
@@ -144,23 +152,35 @@ SIMPLE_JWT = {
 }
 
 # ---------------------------------------------------------------- Celery / Redis
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
-CELERY_BROKER_URL = REDIS_URL
-CELERY_RESULT_BACKEND = REDIS_URL
+# If REDIS_URL is NOT set (e.g. Render free tier with no Redis), tasks run
+# immediately inside the request instead of trying to reach localhost:6379.
+# That connection attempt is a common cause of 500s on register.
+REDIS_URL = os.getenv("REDIS_URL", "")
+CELERY_BROKER_URL = REDIS_URL or "memory://"
+CELERY_RESULT_BACKEND = REDIS_URL or "cache+memory://"
 CELERY_TIMEZONE = "Africa/Nairobi"
+CELERY_TASK_ALWAYS_EAGER = not REDIS_URL
+CELERY_TASK_EAGER_PROPAGATES = False  # a failing task must not crash the request
 
 # ---------------------------------------------------------------- Africa's Talking (SMS)
 AFRICASTALKING_USERNAME = os.getenv("AFRICASTALKING_USERNAME", "sandbox")
 AFRICASTALKING_API_KEY = os.getenv("AFRICASTALKING_API_KEY", "")
 
 # ---------------------------------------------------------------- Email (verification codes)
-EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
 EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
 EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
 EMAIL_USE_TLS = True
 EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
 EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
-DEFAULT_FROM_EMAIL = EMAIL_HOST_USER
+DEFAULT_FROM_EMAIL = EMAIL_HOST_USER or "no-reply@muranga-ecitizen.local"
+# Fail fast instead of hanging until gunicorn kills the worker.
+EMAIL_TIMEOUT = 10
+
+if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
+    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
+else:
+    # No credentials configured: print emails to the Render logs instead of crashing.
+    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
 # ---------------------------------------------------------------- i18n
 LANGUAGE_CODE = "en-us"
@@ -173,10 +193,32 @@ STATIC_URL = "/static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
 STORAGES = {
     "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
-    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedManifestStaticFilesStorage"},
+    # Non-manifest storage: does not 500 if collectstatic hasn't run.
+    "staticfiles": {"BACKEND": "whitenoise.storage.CompressedStaticFilesStorage"},
 }
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 # ---------------------------------------------------------------- Render / HTTPS proxy
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+
+# ---------------------------------------------------------------- Logging
+# Sends full tracebacks to the Render logs so 500 errors are visible.
+LOGGING = {
+    "version": 1,
+    "disable_existing_loggers": False,
+    "formatters": {
+        "simple": {"format": "[{levelname}] {name}: {message}", "style": "{"},
+    },
+    "handlers": {
+        "console": {"class": "logging.StreamHandler", "formatter": "simple"},
+    },
+    "root": {"handlers": ["console"], "level": "INFO"},
+    "loggers": {
+        "django.request": {
+            "handlers": ["console"],
+            "level": "ERROR",
+            "propagate": False,
+        },
+    },
+}
