@@ -124,12 +124,18 @@ TEMPLATES = [
 ]
 
 # ---------------------------------------------------------------- Database
-# On Render, set DATABASE_URL to your Render Postgres connection string.
+# On Render, set DATABASE_URL to your Postgres connection string (Neon).
 # Without it Django falls back to SQLite, which is wiped on every deploy.
+#
+# conn_health_checks=True makes Django test a reused connection before using
+# it. Neon closes idle connections, which caused
+# "SSL connection has been closed unexpectedly" (500) on the first request
+# after a quiet period. With the check, Django opens a fresh connection instead.
 DATABASES = {
     "default": dj_database_url.config(
         default=f"sqlite:///{BASE_DIR / 'db.sqlite3'}",
         conn_max_age=600,
+        conn_health_checks=True,
     )
 }
 
