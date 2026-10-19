@@ -201,14 +201,19 @@ AT_API_KEY=
 # Redis and Celery
 REDIS_URL=redis://localhost:6379/0
 
-# Email (Gmail SMTP). Delete EMAIL_BACKEND to print emails in the terminal instead.
-EMAIL_BACKEND=django.core.mail.backends.smtp.EmailBackend
-EMAIL_HOST=smtp.gmail.com
-EMAIL_PORT=587
-EMAIL_USE_TLS=true
-EMAIL_HOST_USER=youraddress@gmail.com
-EMAIL_HOST_PASSWORD=your16letterapppassword
-DEFAULT_FROM_EMAIL=youraddress@gmail.com
+# HTTPS email provider (Gmail API; no custom domain required)
+GMAIL_CLIENT_ID=
+GMAIL_CLIENT_SECRET=
+GMAIL_REFRESH_TOKEN=
+GMAIL_SENDER=youraddress@gmail.com
+
+# Optional Brevo fallback
+BREVO_API_KEY=
+BREVO_SENDER_EMAIL=
+
+# Never enable for normal production traffic; temporary test code only
+OTP_FIXED_CODE=
+ALLOW_FIXED_OTP=0
 
 # Where the frontend runs (used in the links inside emails)
 FRONTEND_URL=http://localhost:3000
@@ -223,9 +228,9 @@ python -c "from django.core.management.utils import get_random_secret_key; print
 Tips:
 
 * Put the `SECRET_KEY` in single quotes, because characters like `%`, `$` and `#` can break `.env` parsing.
-* `EMAIL_HOST_PASSWORD` is a Gmail **app password**, not your normal password, written without spaces.
-* Restart `runserver` (and the Celery worker) after changing `.env`. It is only read at startup.
-* Delete `EMAIL_BACKEND`, or leave `AT_API_KEY` empty, to test without real email or SMS. Messages then print in the terminal.
+* Gmail API credentials are OAuth credentials, not a Gmail password or app password. Grant the `https://www.googleapis.com/auth/gmail.send` scope and set `GMAIL_SENDER` to the same Gmail mailbox authorized by that refresh token (or a Gmail send-as alias).
+* For an isolated test only, set `OTP_FIXED_CODE` to six digits and `ALLOW_FIXED_OTP=1`. This makes the same code valid for every account; remove both settings immediately after testing.
+* Restart `runserver` after changing `.env`. The local console backend prints development email content to the terminal; it is not used as a production delivery provider.
 
 ---
 
@@ -353,7 +358,7 @@ Authorization: Bearer <access_token>
 | Method | Endpoint | Auth | Purpose |
 |---|---|---|---|
 | POST | `/api/auth/register/` | None | Create a citizen account and send a verification code |
-| POST | `/api/auth/verify/send/` | None | Send (or resend) a verification code |
+| POST | `/api/auth/verify/send/` | None | Send (or resend) a verification code; returns `429` and `Retry-After` during the 60-second cooldown |
 | POST | `/api/auth/verify/confirm/` | None | Confirm the code and verify the account |
 | POST | `/api/auth/login/` | None | Log in with phone or email, returns `access` and `refresh` |
 | POST | `/api/auth/refresh/` | None | Exchange a refresh token for a new access token |
@@ -532,14 +537,16 @@ Copy the **newest** 6-digit code into the variable, then run that request. If yo
 
 ##  Email and SMS setup
 
-### Email (Gmail SMTP)
+### Email (Gmail API; works without owning a domain)
 
-1. Turn on **2-Step Verification** for the Google account.
-2. Go to https://myaccount.google.com/apppasswords and create an app password.
-3. Put it in `.env` as `EMAIL_HOST_PASSWORD`, without spaces.
-4. Restart the server and trigger an email (for example register a new user).
+1. In Google Cloud, create a project, enable the Gmail API, and configure the OAuth consent screen.
+2. Create OAuth credentials and authorize the Gmail mailbox that will send OTP messages with the `https://www.googleapis.com/auth/gmail.send` scope.
+3. Obtain a refresh token for that scope and set `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, and `GMAIL_SENDER` in Render. `GMAIL_SENDER` must be the authorized mailbox or one of its configured Gmail send-as aliases.
+4. Register a test account using an inbox you can access. Check both the recipient inbox/spam and the sender's Sent folder. A Gmail API success means Gmail accepted the message; it does not prove final inbox delivery.
 
-A `535` authentication error means a normal password was used instead of an app password, or 2-Step Verification is off.
+No custom domain is needed to test with a personal Gmail sender. For an OAuth consent screen left in Testing, Google can expire refresh tokens after seven days; reauthorize as needed. A public production application using Gmail scopes may require Google OAuth verification. Do not put OAuth secrets or tokens in source control or logs.
+
+Brevo is an optional HTTPS fallback. Its API returning 201 means it accepted the request, not that a recipient inbox received it. Check Brevo's transactional logs and account/sending-platform status; a Gmail sender address cannot be authenticated with your own domain's DKIM records.
 
 ### SMS (Africa's Talking)
 
@@ -588,16 +595,16 @@ Add these in the service's **Environment** tab. Your local `.env` is not uploade
 | `DATABASE_URL` | Your Neon connection string |
 | `AT_USERNAME`, `AT_API_KEY` | Africa's Talking credentials |
 | `REDIS_URL` | A hosted Redis URL (only if you use Celery) |
-| `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, `GMAIL_SENDER` | Recommended on Render: Gmail API credentials and the authorized Gmail sender address |
-| `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` | Optional HTTPS email-provider fallback |
-| `EMAIL_*`, `DEFAULT_FROM_EMAIL` | SMTP fallback settings; Render may restrict outbound SMTP, so prefer an HTTPS provider |
+| `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, `GMAIL_SENDER` | Gmail API HTTPS sender credentials; no custom domain required |
+| `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` | Optional Brevo HTTPS provider |
+| `OTP_FIXED_CODE`, `ALLOW_FIXED_OTP` | Temporary OTP testing only; remove after testing |
 | `FRONTEND_URL` | Your live frontend address (not `localhost`) |
 
-Email delivery is performed before the API request completes so a Render worker
-shutdown cannot discard a daemon-thread send. Configure Gmail API or Brevo
-credentials in Render rather than relying on Django's console backend; with no
-real provider configured, production logs an explicit delivery error instead
-of reporting the email as sent.
+Email delivery uses synchronous HTTPS requests with a two-second timeout per
+request and one attempt. This avoids losing a daemon-thread send during Render
+shutdown and keeps provider waits bounded. Configure Gmail API or Brevo in
+Render; with no provider configured, production logs an explicit delivery
+error instead of reporting the email as sent.
 
 Also add the live frontend address to your CORS allowed origins in `settings.py`.
 
@@ -653,11 +660,13 @@ Then open a pull request into `main`. Merge the **backend** pull request before 
 | Problem | Likely cause and fix |
 |---|---|
 | Verify page stays stuck, `400` in the terminal | Wrong, expired or replaced code. Use the **newest** code, enter all 6 digits (it can start with 0), or press **Resend code** and wait 60 seconds. |
-| Login returns `403` | The account isn't verified. Verify it, or mark it verified in the Django shell. |
+| Verify-send returns `429` | A code was generated in the last 60 seconds. Use the original code if it arrived; otherwise display the response countdown and retry after it expires. |
+| Login returns `403` | The account isn't verified. Go to verification and use the code from registration; don't automatically request a resend first, because that can be rate-limited. |
 | Login returns `401` | Wrong credentials, or the staff account was deactivated. |
 | Existing users locked out after the update | Run the "mark all users verified" command from the verification section. |
-| `SMTPAuthenticationError 535` | Use a Gmail app password with 2-Step Verification, no spaces. |
-| Emails print in the terminal | `EMAIL_BACKEND` is missing, which is the intended test mode. Set the SMTP backend to send for real. |
+| Gmail API reports `invalid_grant` | Reauthorize the sender mailbox and replace the refresh token; OAuth test-mode tokens may expire after seven days. |
+| Brevo returns 201 but no email arrives | Check Brevo transactional logs, account sending status, recipient suppression/bounce state, and sender authentication. A 201 is provider acceptance, not inbox delivery. |
+| No email provider accepts the message | Configure the Gmail API OAuth variables or Brevo HTTPS credentials in Render; production does not use the local console backend. |
 | `SSL: WRONG_VERSION_NUMBER` when sending SMS | A proxy, VPN or antivirus is interfering. Clear `HTTPS_PROXY` and `HTTP_PROXY`, or leave `AT_API_KEY` empty to print SMS in the terminal. |
 | SMS not arriving on a phone | The Africa's Talking sandbox only logs messages in the simulator. |
 | Africa's Talking `401` | Sandbox keys only work with the username `sandbox`. Check for stray spaces in the key. |
@@ -680,7 +689,7 @@ Then open a pull request into `main`. Merge the **backend** pull request before 
 8. **Audit logs.** An append-only record of actions, readable only by admins.
 9. **Announcements** for county notices.
 10. **One-time codes.** A `OneTimeCode` model plus `otp.py` and `verification.py` for account verification, forgot password, reset and change password, with hashed codes, expiry, attempt limits and a resend cooldown.
-11. **Delivery.** Codes go out by email (Gmail SMTP) and SMS (Africa's Talking), with a terminal fallback for development.
+11. **Delivery.** Codes go out by email (Gmail API or Brevo HTTPS) and SMS (Africa's Talking), with a local-only console fallback for development.
 12. **Login protection.** Unverified citizens are blocked at login with a clear message.
 13. **Testing.** A PowerShell smoke-test script and the Postman collection that cover public, citizen, privacy, officer, head and admin behaviour.
 14. **Repository hygiene.** A backend `.gitignore`, a `.env.example` template, feature branches and pull requests.

@@ -3,6 +3,7 @@ import hashlib
 import hmac
 import html
 import logging
+import math
 import os
 import secrets
 from datetime import timedelta
@@ -13,6 +14,7 @@ from urllib.parse import quote
 import requests
 from django.conf import settings
 from django.core.mail import send_mail
+from django.db import transaction
 from django.utils import timezone
 
 from .models import OneTimeCode
@@ -23,9 +25,8 @@ CODE_TTL = timedelta(minutes=getattr(settings, 'OTP_TTL_MINUTES', 15))
 RESEND_COOLDOWN = timedelta(seconds=60)
 MAX_ATTEMPTS = 5
 
-# Email providers can be slow on the first call; allow longer and retry once.
-EMAIL_TIMEOUT_SECONDS = 20
-EMAIL_ATTEMPTS = 2
+# Keep synchronous provider calls short enough for Render's request worker.
+PROVIDER_TIMEOUT_SECONDS = 2
 
 # Frontend pages the email link opens
 FRONTEND_PATHS = {
@@ -43,37 +44,44 @@ def _hash(user, purpose, code):
 
 def _generate_code():
     """
-    Return the 6-digit code.
-
-    If OTP_FIXED_CODE is set in the environment (exactly 6 digits), that code is used
-    for every user. This is for testing only. Remove the variable to go back to
-    random codes.
+    Return a random 6-digit code unless fixed-code testing is explicitly enabled.
     """
     fixed = os.environ.get('OTP_FIXED_CODE', '').strip()
-    if len(fixed) == 6 and fixed.isdigit():
-        if settings.DEBUG:
-            logger.warning('OTP_FIXED_CODE is active: every account uses the same code. Testing only.')
+    if os.environ.get('ALLOW_FIXED_OTP') == '1':
+        if len(fixed) == 6 and fixed.isdigit():
+            logger.warning('Fixed OTP testing is enabled; using a non-random OTP')
             return fixed
-        logger.error('Ignoring OTP_FIXED_CODE because DEBUG is disabled')
+        logger.error('ALLOW_FIXED_OTP is enabled but OTP_FIXED_CODE is not six digits')
+    elif fixed:
+        logger.error('Ignoring OTP_FIXED_CODE because ALLOW_FIXED_OTP is not set to 1')
     return f'{secrets.randbelow(1_000_000):06d}'
 
 
-def issue_code(user, purpose, force=False):
-    """Create a new 6-digit code. Returns the plain code, or None if the resend cooldown applies."""
-    now = timezone.now()
+def resend_cooldown_seconds(user, purpose):
+    """Return the remaining resend cooldown, rounded up to a whole second."""
     last = (
         OneTimeCode.objects.filter(user=user, purpose=purpose)
         .order_by('-created_at')
         .first()
     )
-    if last and not force and now - last.created_at < RESEND_COOLDOWN:
-        return None
+    if not last:
+        return 0
+    remaining = RESEND_COOLDOWN - (timezone.now() - last.created_at)
+    return max(0, math.ceil(remaining.total_seconds()))
 
-    # Only one active code at a time
-    OneTimeCode.objects.filter(user=user, purpose=purpose, used=False).update(used=True)
 
-    code = _generate_code()
-    OneTimeCode.objects.create(user=user, purpose=purpose, code_hash=_hash(user, purpose, code))
+def issue_code(user, purpose, force=False):
+    """Create a new 6-digit code. Returns the plain code, or None if the resend cooldown applies."""
+    with transaction.atomic():
+        type(user).objects.select_for_update().get(pk=user.pk)
+        if not force and resend_cooldown_seconds(user, purpose):
+            return None
+
+        # Only one active code at a time
+        OneTimeCode.objects.filter(user=user, purpose=purpose, used=False).update(used=True)
+
+        code = _generate_code()
+        OneTimeCode.objects.create(user=user, purpose=purpose, code_hash=_hash(user, purpose, code))
     return code
 
 
@@ -116,6 +124,34 @@ def _frontend_url():
     return url.rstrip('/')
 
 
+def _provider_error_reason(response):
+    """Extract a provider's public error reason without logging request credentials."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return 'non-JSON error response'
+
+    if not isinstance(payload, dict):
+        return 'provider returned an unexpected error response'
+
+    error = payload.get('error')
+    if isinstance(error, dict):
+        error_details = error.get('errors', [])
+        if not isinstance(error_details, list):
+            error_details = []
+        reasons = [
+            item.get('reason')
+            for item in error_details
+            if isinstance(item, dict) and item.get('reason')
+        ]
+        message = error.get('message')
+        return '; '.join(str(part) for part in (reasons[0] if reasons else '', message) if part)
+    if isinstance(error, str):
+        return '; '.join(str(part) for part in (error, payload.get('error_description')) if part)
+
+    return str(payload.get('message') or payload.get('code') or 'unspecified provider error')
+
+
 def send_sms(phone, message):
     if not phone:
         return False
@@ -143,7 +179,7 @@ def send_sms(phone, message):
             f'https://{base}/version1/messaging',
             headers={'apiKey': api_key, 'Accept': 'application/json'},
             data={'username': username, 'to': _to_international(phone), 'message': message},
-            timeout=10,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
         )
         r.raise_for_status()
         return True
@@ -166,6 +202,7 @@ def send_gmail_api(to_email, subject, body, html_body=None):
     refresh_token = os.environ.get('GMAIL_REFRESH_TOKEN', '')
     sender = os.environ.get('GMAIL_SENDER', '')
     if not (client_id and client_secret and refresh_token and sender):
+        logger.info('provider=gmail recipient=%s result=not_configured', to_email)
         return None
 
     try:
@@ -177,10 +214,15 @@ def send_gmail_api(to_email, subject, body, html_body=None):
                 'refresh_token': refresh_token,
                 'grant_type': 'refresh_token',
             },
-            timeout=EMAIL_TIMEOUT_SECONDS,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
         )
         if tok.status_code >= 400:
-            logger.error('Gmail token request failed (%s): %s', tok.status_code, tok.text)
+            logger.error(
+                'provider=gmail recipient=%s result=failed stage=token status=%s reason=%s',
+                to_email,
+                tok.status_code,
+                _provider_error_reason(tok),
+            )
             return False
         access_token = tok.json()['access_token']
 
@@ -197,23 +239,40 @@ def send_gmail_api(to_email, subject, body, html_body=None):
             'https://gmail.googleapis.com/gmail/v1/users/me/messages/send',
             headers={'Authorization': f'Bearer {access_token}'},
             json={'raw': raw},
-            timeout=EMAIL_TIMEOUT_SECONDS,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
         )
         if r.status_code >= 400:
-            logger.error('Gmail API rejected the email (%s): %s', r.status_code, r.text)
+            logger.error(
+                'provider=gmail recipient=%s result=failed stage=send status=%s reason=%s',
+                to_email,
+                r.status_code,
+                _provider_error_reason(r),
+            )
             return False
-        logger.info('Gmail API sent email to %s', to_email)
+        logger.info('provider=gmail recipient=%s result=accepted status=%s', to_email, r.status_code)
         return True
-    except Exception:
-        logger.exception('Gmail API sending failed')
+    except requests.RequestException as exc:
+        logger.error(
+            'provider=gmail recipient=%s result=failed reason=%s',
+            to_email,
+            type(exc).__name__,
+        )
+        return False
+    except (KeyError, ValueError) as exc:
+        logger.error(
+            'provider=gmail recipient=%s result=failed reason=%s',
+            to_email,
+            type(exc).__name__,
+        )
         return False
 
 
 def _send_brevo(to_email, subject, body, html_body=None):
-    """Send via Brevo's HTTPS API. Returns None if not configured, True if accepted, False otherwise."""
+    """Send via Brevo's HTTPS API once. Returns None if not configured."""
     api_key = os.environ.get('BREVO_API_KEY', '')
     sender = os.environ.get('BREVO_SENDER_EMAIL', '')
     if not (api_key and sender):
+        logger.info('provider=brevo recipient=%s result=not_configured', to_email)
         return None
 
     payload = {
@@ -226,38 +285,40 @@ def _send_brevo(to_email, subject, body, html_body=None):
     if html_body:
         payload['htmlContent'] = html_body
 
-    for attempt in range(1, EMAIL_ATTEMPTS + 1):
-        try:
-            r = requests.post(
-                'https://api.brevo.com/v3/smtp/email',
-                headers={
-                    'api-key': api_key,
-                    'accept': 'application/json',
-                    'content-type': 'application/json',
-                },
-                json=payload,
-                timeout=EMAIL_TIMEOUT_SECONDS,
-            )
-            if r.status_code >= 400:
-                # A rejection will not fix itself on retry
-                logger.error('Brevo rejected the email (%s): %s', r.status_code, r.text)
-                return False
-            logger.info('Brevo accepted email to %s (%s)', to_email, r.status_code)
-            return True
-        except (requests.Timeout, requests.ConnectionError):
-            logger.warning('Brevo email attempt %s/%s timed out or lost connection', attempt, EMAIL_ATTEMPTS)
-        except Exception:
-            logger.exception('Brevo email sending failed')
-            return False
+    try:
+        r = requests.post(
+            'https://api.brevo.com/v3/smtp/email',
+            headers={
+                'api-key': api_key,
+                'accept': 'application/json',
+                'content-type': 'application/json',
+            },
+            json=payload,
+            timeout=PROVIDER_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        logger.error(
+            'provider=brevo recipient=%s result=failed reason=%s',
+            to_email,
+            type(exc).__name__,
+        )
+        return False
 
-    logger.error('Brevo email failed after %s attempts', EMAIL_ATTEMPTS)
-    return False
+    if r.status_code >= 400:
+        logger.error(
+            'provider=brevo recipient=%s result=failed status=%s reason=%s',
+            to_email,
+            r.status_code,
+            _provider_error_reason(r),
+        )
+        return False
+    logger.info('provider=brevo recipient=%s result=accepted status=%s', to_email, r.status_code)
+    return True
 
 
 def send_email(to_email, subject, body, html_body=None):
     """
-    Try the Gmail API first (if configured), then Brevo (if configured),
-    then Django's email backend (console backend prints to the logs).
+    Try configured HTTPS providers. The local console backend is only used in DEBUG.
     """
     result = send_gmail_api(to_email, subject, body, html_body)
     if result:
@@ -271,18 +332,23 @@ def send_email(to_email, subject, body, html_body=None):
         # A configured API provider failed; don't hide its failure with another backend.
         return False
 
-    if (
-        not settings.DEBUG
-        and settings.EMAIL_BACKEND == 'django.core.mail.backends.console.EmailBackend'
-    ):
-        logger.error('Email not sent to %s: the console email backend is enabled in production', to_email)
+    if not (settings.DEBUG and settings.EMAIL_BACKEND == 'django.core.mail.backends.console.EmailBackend'):
+        logger.error(
+            'provider=none recipient=%s result=failed reason=no HTTPS email provider accepted the message',
+            to_email,
+        )
         return False
 
     try:
-        send_mail(subject=subject, message=body, from_email=None, recipient_list=[to_email])
-        return True
-    except Exception:
-        logger.exception('Email sending failed')
+        sent = send_mail(subject=subject, message=body, from_email=None, recipient_list=[to_email])
+        logger.info('provider=django-console recipient=%s result=%s', to_email, 'accepted' if sent else 'failed')
+        return sent == 1
+    except Exception as exc:
+        logger.error(
+            'provider=django-console recipient=%s result=failed reason=%s',
+            to_email,
+            type(exc).__name__,
+        )
         return False
 
 

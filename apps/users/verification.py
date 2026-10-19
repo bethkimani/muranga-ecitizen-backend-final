@@ -8,11 +8,11 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .login import normalize_phone
-from .otp import check_code, deliver, issue_code
+from .otp import check_code, deliver, issue_code, resend_cooldown_seconds
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
-GENERIC = {'detail': 'If the account exists, a code has been sent.'}
+GENERIC = {'detail': 'If the account exists, the code request has been processed.'}
 
 
 def get_identifier(request):
@@ -42,6 +42,20 @@ class SendCodeView(APIView):
         if user and user.is_active:
             if not (self.purpose == 'VERIFY' and user.is_phone_verified):
                 code = issue_code(user, self.purpose)  # None if resent within 60 seconds
+                if code is None:
+                    retry_after = max(1, resend_cooldown_seconds(user, self.purpose))
+                    response = Response(
+                        {
+                            'detail': (
+                                f'A code was generated recently. If you have not received it, '
+                                f'you can request another in {retry_after} seconds.'
+                            ),
+                            'retry_after': retry_after,
+                        },
+                        status=status.HTTP_429_TOO_MANY_REQUESTS,
+                    )
+                    response['Retry-After'] = str(retry_after)
+                    return response
                 deliver(user, self.purpose, code)
         return Response(GENERIC)
 

@@ -187,20 +187,9 @@ AT_USERNAME = AFRICASTALKING_USERNAME
 AT_API_KEY = AFRICASTALKING_API_KEY
 
 # ---------------------------------------------------------------- Email (verification codes)
-EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")
-EMAIL_PORT = int(os.getenv("EMAIL_PORT", "587"))
-EMAIL_USE_TLS = True
-EMAIL_HOST_USER = os.getenv("EMAIL_HOST_USER", "")
-EMAIL_HOST_PASSWORD = os.getenv("EMAIL_HOST_PASSWORD", "")
-DEFAULT_FROM_EMAIL = EMAIL_HOST_USER or "no-reply@muranga-ecitizen.local"
-# Fail fast instead of hanging until gunicorn kills the worker.
-EMAIL_TIMEOUT = 10
-
-if EMAIL_HOST_USER and EMAIL_HOST_PASSWORD:
-    EMAIL_BACKEND = "django.core.mail.backends.smtp.EmailBackend"
-else:
-    # No credentials configured: print emails to the Render logs instead of crashing.
-    EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
+# Production delivery uses HTTPS providers in apps.users.otp. In DEBUG, Django's
+# console backend is available for local development only.
+EMAIL_BACKEND = "django.core.mail.backends.console.EmailBackend"
 
 # ---------------------------------------------------------------- i18n
 LANGUAGE_CODE = "en-us"
