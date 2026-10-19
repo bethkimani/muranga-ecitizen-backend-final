@@ -1,9 +1,11 @@
+import logging
+import os
 from types import SimpleNamespace
 from unittest.mock import patch
 
 from django.test import TestCase, override_settings
 
-from .otp import deliver, send_email
+from .otp import _generate_code, deliver, send_email, send_sms
 
 
 class EmailDeliveryTests(TestCase):
@@ -30,3 +32,25 @@ class EmailDeliveryTests(TestCase):
         self.assertFalse(send_email('resident@example.com', 'Subject', 'Body'))
 
         send_mail_mock.assert_not_called()
+
+
+class OtpConfigurationTests(TestCase):
+    @override_settings(DEBUG=False)
+    @patch.dict(os.environ, {'OTP_FIXED_CODE': '123456'})
+    @patch('apps.users.otp.secrets.randbelow', return_value=7)
+    def test_fixed_otp_is_ignored_when_debug_is_disabled(self, randbelow_mock):
+        self.assertEqual(_generate_code(), '000007')
+        randbelow_mock.assert_called_once_with(1_000_000)
+
+    @override_settings(DEBUG=True)
+    @patch.dict(os.environ, {'OTP_FIXED_CODE': '123456'})
+    def test_fixed_otp_is_allowed_in_debug_mode(self):
+        self.assertEqual(_generate_code(), '123456')
+
+    @patch('apps.users.otp.settings.AT_API_KEY', '')
+    @patch('apps.users.otp.settings.AFRICASTALKING_API_KEY', '')
+    def test_missing_sms_credentials_do_not_log_the_message(self):
+        with self.assertLogs('apps.users.otp', level=logging.WARNING) as logs:
+            self.assertFalse(send_sms('0712345678', 'Your code is 123456'))
+
+        self.assertNotIn('123456', '\n'.join(logs.output))

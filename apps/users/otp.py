@@ -5,7 +5,6 @@ import html
 import logging
 import os
 import secrets
-import threading
 from datetime import timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -52,8 +51,10 @@ def _generate_code():
     """
     fixed = os.environ.get('OTP_FIXED_CODE', '').strip()
     if len(fixed) == 6 and fixed.isdigit():
-        logger.warning('OTP_FIXED_CODE is active: every account uses the same code. Testing only.')
-        return fixed
+        if settings.DEBUG:
+            logger.warning('OTP_FIXED_CODE is active: every account uses the same code. Testing only.')
+            return fixed
+        logger.error('Ignoring OTP_FIXED_CODE because DEBUG is disabled')
     return f'{secrets.randbelow(1_000_000):06d}'
 
 
@@ -133,7 +134,7 @@ def send_sms(phone, message):
 
     # No real key yet: log instead of sending so registration still works
     if not api_key or api_key.startswith(('your_', 'PASTE')):
-        logger.warning('[SMS not sent, no API key] to %s: %s', phone, message)
+        logger.warning('[SMS not sent, no API key]')
         return False
 
     base = 'api.sandbox.africastalking.com' if username == 'sandbox' else 'api.africastalking.com'
@@ -262,32 +263,27 @@ def send_email(to_email, subject, body, html_body=None):
     if result:
         return True
 
-    result = _send_brevo(to_email, subject, body, html_body)
-    if result:
+    brevo_result = _send_brevo(to_email, subject, body, html_body)
+    if brevo_result:
         return True
-    if result is False:
-        # Brevo is configured but failed; do not fall through silently
+
+    if result is False or brevo_result is False:
+        # A configured API provider failed; don't hide its failure with another backend.
         return False
 
-    # Nothing configured: use whatever EMAIL_BACKEND is set
+    if (
+        not settings.DEBUG
+        and settings.EMAIL_BACKEND == 'django.core.mail.backends.console.EmailBackend'
+    ):
+        logger.error('Email not sent to %s: the console email backend is enabled in production', to_email)
+        return False
+
     try:
         send_mail(subject=subject, message=body, from_email=None, recipient_list=[to_email])
         return True
     except Exception:
         logger.exception('Email sending failed')
         return False
-
-
-def _send_email_background(to_email, subject, body, html_body):
-    """Run send_email in a background thread so the request does not wait for the provider."""
-
-    def _run():
-        try:
-            send_email(to_email, subject, body, html_body)
-        except Exception:
-            logger.exception('Background email sending failed')
-
-    threading.Thread(target=_run, daemon=True).start()
 
 
 def _build_html(label, code, minutes, link):
@@ -338,7 +334,7 @@ def deliver(user, purpose, code):
         return
 
     if email:
-        _send_email_background(
+        send_email(
             email,
             subject,
             f'{text}\n\nOr open this link:\n{link}',
