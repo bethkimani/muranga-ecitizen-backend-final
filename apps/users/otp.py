@@ -1,8 +1,10 @@
 import hashlib
 import hmac
+import html
 import logging
 import os
 import secrets
+import threading
 from datetime import timedelta
 from urllib.parse import quote
 
@@ -18,6 +20,10 @@ logger = logging.getLogger(__name__)
 CODE_TTL = timedelta(minutes=getattr(settings, 'OTP_TTL_MINUTES', 15))
 RESEND_COOLDOWN = timedelta(seconds=60)
 MAX_ATTEMPTS = 5
+
+# Brevo can be slow on the first call; allow longer and retry once.
+EMAIL_TIMEOUT_SECONDS = 20
+EMAIL_ATTEMPTS = 2
 
 # Frontend pages the email link opens
 FRONTEND_PATHS = {
@@ -127,35 +133,46 @@ def send_sms(phone, message):
         return False
 
 
-def send_email(to_email, subject, body):
+def send_email(to_email, subject, body, html_body=None):
     """Send via Brevo's HTTPS API if configured, else fall back to Django's email backend."""
     api_key = os.environ.get('BREVO_API_KEY', '')
     sender = os.environ.get('BREVO_SENDER_EMAIL', '')
 
     if api_key and sender:
-        try:
-            r = requests.post(
-                'https://api.brevo.com/v3/smtp/email',
-                headers={
-                    'api-key': api_key,
-                    'accept': 'application/json',
-                    'content-type': 'application/json',
-                },
-                json={
-                    'sender': {'name': "Murang'a e-Citizen", 'email': sender},
-                    'to': [{'email': to_email}],
-                    'subject': subject,
-                    'textContent': body,
-                },
-                timeout=10,
-            )
-            if r.status_code >= 400:
-                logger.error('Brevo rejected the email (%s): %s', r.status_code, r.text)
+        payload = {
+            'sender': {'name': "Murang'a e-Citizen", 'email': sender},
+            'replyTo': {'name': "Murang'a e-Citizen", 'email': sender},
+            'to': [{'email': to_email}],
+            'subject': subject,
+            'textContent': body,
+        }
+        if html_body:
+            payload['htmlContent'] = html_body
+
+        for attempt in range(1, EMAIL_ATTEMPTS + 1):
+            try:
+                r = requests.post(
+                    'https://api.brevo.com/v3/smtp/email',
+                    headers={
+                        'api-key': api_key,
+                        'accept': 'application/json',
+                        'content-type': 'application/json',
+                    },
+                    json=payload,
+                    timeout=EMAIL_TIMEOUT_SECONDS,
+                )
+                if r.status_code >= 400:
+                    # A rejection will not fix itself on retry
+                    logger.error('Brevo rejected the email (%s): %s', r.status_code, r.text)
+                    return False
+                return True
+            except (requests.Timeout, requests.ConnectionError):
+                logger.warning('Brevo email attempt %s/%s timed out or lost connection', attempt, EMAIL_ATTEMPTS)
+            except Exception:
+                logger.exception('Brevo email sending failed')
                 return False
-            return True
-        except Exception:
-            logger.exception('Brevo email sending failed')
-            return False
+        logger.error('Brevo email failed after %s attempts', EMAIL_ATTEMPTS)
+        return False
 
     # No Brevo config: use whatever EMAIL_BACKEND is set (console backend prints to logs)
     try:
@@ -164,6 +181,37 @@ def send_email(to_email, subject, body):
     except Exception:
         logger.exception('Email sending failed')
         return False
+
+
+def _send_email_background(to_email, subject, body, html_body):
+    """Run send_email in a background thread so the request does not wait for Brevo."""
+
+    def _run():
+        try:
+            send_email(to_email, subject, body, html_body)
+        except Exception:
+            logger.exception('Background email sending failed')
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+def _build_html(label, code, minutes, link):
+    safe_label = html.escape(label)
+    safe_code = html.escape(code)
+    safe_link = html.escape(link, quote=True)
+    return (
+        '<div style="font-family:Arial,Helvetica,sans-serif;max-width:480px;margin:0 auto;'
+        'padding:24px;color:#1f2937">'
+        "<h2 style=\"margin:0 0 12px;color:#047857\">Murang'a e-Citizen</h2>"
+        f'<p>Use this code to {safe_label}:</p>'
+        f'<p style="font-size:32px;letter-spacing:6px;font-weight:bold;margin:16px 0">{safe_code}</p>'
+        f'<p>It expires in {minutes} minutes. Do not share it with anyone.</p>'
+        f'<p><a href="{safe_link}" style="display:inline-block;background:#047857;color:#ffffff;'
+        'padding:10px 18px;border-radius:6px;text-decoration:none">Open the verification page</a></p>'
+        '<p style="font-size:12px;color:#6b7280;margin-top:24px">If you did not request this, '
+        'you can ignore this email.</p>'
+        '</div>'
+    )
 
 
 def deliver(user, purpose, code):
@@ -182,15 +230,19 @@ def deliver(user, purpose, code):
             f"Your Murang'a e-Citizen code to {label} is {code}. "
             f"It expires in {minutes} minutes. Do not share it with anyone."
         )
+        email = user.email
+        phone = getattr(user, 'phone_number', '')
+        html_body = _build_html(label, code, minutes, link)
     except Exception:
         logger.exception('Could not build verification message')
         return
 
-    if user.email:
-        send_email(
-            user.email,
+    if email:
+        _send_email_background(
+            email,
             f"Murang'a e-Citizen: your code is {code}",
             f'{text}\n\nOr open this link:\n{link}',
+            html_body,
         )
 
-    send_sms(getattr(user, 'phone_number', ''), text)
+    send_sms(phone, text)
