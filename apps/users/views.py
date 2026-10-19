@@ -7,7 +7,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from apps.users.login import normalize_phone
-from apps.users.otp import deliver, issue_code
+from apps.users.otp import deliver, is_otp_required, issue_code
 from apps.users.serializers import RegisterSerializer, UserSerializer
 
 User = get_user_model()
@@ -20,6 +20,13 @@ class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
 
     def perform_create(self, serializer):
+        if not is_otp_required():
+            with transaction.atomic():
+                user = serializer.save()
+                user.is_phone_verified = True
+                user.save(update_fields=['is_phone_verified'])
+            return
+
         # Create the user and their code together: both succeed or neither does.
         with transaction.atomic():
             user = serializer.save()

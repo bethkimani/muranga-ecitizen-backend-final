@@ -37,6 +37,11 @@ FRONTEND_PATHS = {
 DEFAULT_FRONTEND_URL = 'https://muranga-ecitizen-frontend-final.vercel.app'
 
 
+def is_otp_required():
+    """Return whether account verification OTP is enabled (enabled by default)."""
+    return os.environ.get('OTP_REQUIRED', '1').strip() != '0'
+
+
 def _hash(user, purpose, code):
     raw = f'{user.pk}:{purpose}:{code}:{settings.SECRET_KEY}'
     return hashlib.sha256(raw.encode()).hexdigest()

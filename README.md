@@ -357,9 +357,9 @@ Authorization: Bearer <access_token>
 
 | Method | Endpoint | Auth | Purpose |
 |---|---|---|---|
-| POST | `/api/auth/register/` | None | Create a citizen account and send a verification code |
-| POST | `/api/auth/verify/send/` | None | Send (or resend) a verification code; returns `429` and `Retry-After` during the 60-second cooldown |
-| POST | `/api/auth/verify/confirm/` | None | Confirm the code and verify the account |
+| POST | `/api/auth/register/` | None | Create a citizen account; sends a verification code only when `OTP_REQUIRED=1` |
+| POST | `/api/auth/verify/send/` | None | Send (or resend) a verification code when `OTP_REQUIRED=1` |
+| POST | `/api/auth/verify/confirm/` | None | Confirm the code when `OTP_REQUIRED=1` |
 | POST | `/api/auth/login/` | None | Log in with phone or email, returns `access` and `refresh` |
 | POST | `/api/auth/refresh/` | None | Exchange a refresh token for a new access token |
 | GET | `/api/auth/me/` | Token | Current user's profile |
@@ -598,7 +598,16 @@ Add these in the service's **Environment** tab. Your local `.env` is not uploade
 | `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, `GMAIL_SENDER` | Gmail API HTTPS sender credentials; no custom domain required |
 | `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` | Optional Brevo HTTPS provider |
 | `OTP_FIXED_CODE`, `ALLOW_FIXED_OTP` | Temporary OTP testing only; remove after testing |
+| `OTP_REQUIRED` | `1` (default) requires account verification; set to `0` to bypass it |
 | `FRONTEND_URL` | Your live frontend address (not `localhost`) |
+
+Set `OTP_REQUIRED=0` on Render and deploy to allow registration and login
+without account verification. The `0005_mark_existing_users_verified`
+migration marks existing accounts verified; run `python manage.py migrate` in
+the Render Shell if the deploy does not already run migrations. Turning
+verification off reduces account security. Existing accounts marked verified by
+this migration remain verified if you later set `OTP_REQUIRED=1`; new accounts
+will require verification again.
 
 Email delivery uses synchronous HTTPS requests with a two-second timeout per
 request and one attempt. This avoids losing a daemon-thread send during Render

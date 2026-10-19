@@ -6,8 +6,10 @@ from unittest.mock import patch
 from django.test import TestCase, override_settings
 from rest_framework.test import APIRequestFactory
 
-from .otp import _generate_code, deliver, send_email, send_gmail_api, send_sms
-from .verification import SendCodeView
+from .login import LoginSerializer
+from .otp import _generate_code, deliver, is_otp_required, send_email, send_gmail_api, send_sms
+from .verification import ConfirmVerifyView, SendCodeView
+from .views import RegisterView
 
 
 class EmailDeliveryTests(TestCase):
@@ -58,6 +60,138 @@ class OtpConfigurationTests(TestCase):
             self.assertFalse(send_sms('0712345678', 'Your code is 123456'))
 
         self.assertNotIn('123456', '\n'.join(logs.output))
+
+
+class OtpRequiredSwitchTests(TestCase):
+    @patch.dict(os.environ, {}, clear=True)
+    def test_otp_is_required_by_default(self):
+        self.assertTrue(is_otp_required())
+
+    @patch.dict(os.environ, {'OTP_REQUIRED': '0'})
+    def test_otp_is_disabled_only_by_zero(self):
+        self.assertFalse(is_otp_required())
+
+    @patch.dict(os.environ, {'OTP_REQUIRED': '1'})
+    def test_otp_can_be_enabled(self):
+        self.assertTrue(is_otp_required())
+
+    @patch('apps.users.views.deliver')
+    @patch('apps.users.views.issue_code')
+    @patch('apps.users.views.is_otp_required', return_value=False)
+    def test_register_marks_user_verified_without_issuing_or_sending_code(
+        self, otp_required_mock, issue_code_mock, deliver_mock
+    ):
+        from django.contrib.auth import get_user_model
+
+        user = get_user_model().objects.create_user(
+            username='otp-disabled',
+            phone_number='0712345678',
+            email='otp-disabled@example.com',
+            password='safe-test-password',
+        )
+        serializer = SimpleNamespace(save=lambda: user)
+
+        RegisterView().perform_create(serializer)
+
+        user.refresh_from_db()
+        self.assertTrue(user.is_phone_verified)
+        issue_code_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+
+    @patch.dict(os.environ, {'OTP_REQUIRED': '0'})
+    def test_login_allows_existing_unverified_user_when_otp_disabled(self):
+        from django.contrib.auth import get_user_model
+
+        get_user_model().objects.create_user(
+            username='unverified',
+            phone_number='0712345679',
+            email='unverified@example.com',
+            password='safe-test-password',
+            is_phone_verified=False,
+        )
+        serializer = LoginSerializer(
+            data={
+                'identifier': 'unverified@example.com',
+                'password': 'safe-test-password',
+            }
+        )
+
+        self.assertTrue(serializer.is_valid(), serializer.errors)
+        self.assertIn('access', serializer.validated_data)
+        self.assertIn('refresh', serializer.validated_data)
+
+    @patch.dict(os.environ, {'OTP_REQUIRED': '1'})
+    def test_login_still_rejects_unverified_user_when_otp_enabled(self):
+        from django.contrib.auth import get_user_model
+        from rest_framework.exceptions import PermissionDenied
+
+        get_user_model().objects.create_user(
+            username='unverified-required',
+            phone_number='0712345680',
+            email='unverified-required@example.com',
+            password='safe-test-password',
+            is_phone_verified=False,
+        )
+        serializer = LoginSerializer()
+
+        with self.assertRaises(PermissionDenied):
+            serializer.validate(
+                {
+                    'identifier': 'unverified-required@example.com',
+                    'password': 'safe-test-password',
+                }
+            )
+
+    @patch.dict(os.environ, {'OTP_REQUIRED': '0'})
+    @patch('apps.users.verification.find_user')
+    @patch('apps.users.verification.issue_code')
+    @patch('apps.users.verification.deliver')
+    def test_verify_endpoints_return_ok_without_lookup_or_delivery(
+        self, deliver_mock, issue_code_mock, find_user_mock
+    ):
+        factory = APIRequestFactory()
+        send_response = SendCodeView.as_view(purpose='VERIFY')(
+            factory.post(
+                '/api/auth/verify/send/',
+                {'identifier': 'resident@example.com'},
+                format='json',
+            )
+        )
+        confirm_response = ConfirmVerifyView.as_view()(
+            factory.post(
+                '/api/auth/verify/confirm/',
+                {'identifier': 'resident@example.com', 'code': '123456'},
+                format='json',
+            )
+        )
+
+        self.assertEqual(send_response.status_code, 200)
+        self.assertEqual(confirm_response.status_code, 200)
+        self.assertEqual(send_response.data, {'detail': 'Account verification is disabled.'})
+        self.assertEqual(confirm_response.data, {'detail': 'Account verification is disabled.'})
+        find_user_mock.assert_not_called()
+        issue_code_mock.assert_not_called()
+        deliver_mock.assert_not_called()
+
+    @patch.dict(os.environ, {'OTP_REQUIRED': '0'})
+    @patch('apps.users.verification.find_user')
+    @patch('apps.users.verification.issue_code', return_value='654321')
+    @patch('apps.users.verification.deliver')
+    def test_disabling_account_verification_does_not_disable_password_reset_codes(
+        self, deliver_mock, issue_code_mock, find_user_mock
+    ):
+        find_user_mock.return_value = SimpleNamespace(is_active=True, is_phone_verified=False)
+        request = APIRequestFactory().post(
+            '/api/auth/password/forgot/',
+            {'identifier': 'resident@example.com'},
+            format='json',
+        )
+
+        response = SendCodeView.as_view(purpose='RESET')(request)
+
+        self.assertEqual(response.status_code, 200)
+        issue_code_mock.assert_called_once()
+        deliver_mock.assert_called_once()
 
 
 class VerifySendCooldownTests(TestCase):

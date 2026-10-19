@@ -4,6 +4,8 @@ from rest_framework.exceptions import PermissionDenied
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
 
+from .otp import is_otp_required
+
 User = get_user_model()
 
 
@@ -40,7 +42,11 @@ class LoginSerializer(TokenObtainPairSerializer):
         data = super().validate(attrs)
 
         # Residents must verify before they can sign in (staff accounts are created verified)
-        if self.user.role == 'CITIZEN' and not self.user.is_phone_verified:
+        if (
+            is_otp_required()
+            and self.user.role == 'CITIZEN'
+            and not self.user.is_phone_verified
+        ):
             raise PermissionDenied('Please verify your account first.')
         return data
 
