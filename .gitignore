@@ -1,0 +1,12 @@
+
+# Python / Django
+backend/venv/
+__pycache__/
+*.pyc
+db.sqlite3
+backend/staticfiles/
+
+# Secrets
+.env
+backend/.env
+.env.local
