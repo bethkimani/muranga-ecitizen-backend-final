@@ -1,6 +1,7 @@
 import hashlib
 import hmac
 import logging
+import os
 import secrets
 from datetime import timedelta
 from urllib.parse import quote
@@ -126,6 +127,45 @@ def send_sms(phone, message):
         return False
 
 
+def send_email(to_email, subject, body):
+    """Send via Brevo's HTTPS API if configured, else fall back to Django's email backend."""
+    api_key = os.environ.get('BREVO_API_KEY', '')
+    sender = os.environ.get('BREVO_SENDER_EMAIL', '')
+
+    if api_key and sender:
+        try:
+            r = requests.post(
+                'https://api.brevo.com/v3/smtp/email',
+                headers={
+                    'api-key': api_key,
+                    'accept': 'application/json',
+                    'content-type': 'application/json',
+                },
+                json={
+                    'sender': {'name': "Murang'a e-Citizen", 'email': sender},
+                    'to': [{'email': to_email}],
+                    'subject': subject,
+                    'textContent': body,
+                },
+                timeout=10,
+            )
+            if r.status_code >= 400:
+                logger.error('Brevo rejected the email (%s): %s', r.status_code, r.text)
+                return False
+            return True
+        except Exception:
+            logger.exception('Brevo email sending failed')
+            return False
+
+    # No Brevo config: use whatever EMAIL_BACKEND is set (console backend prints to logs)
+    try:
+        send_mail(subject=subject, message=body, from_email=None, recipient_list=[to_email])
+        return True
+    except Exception:
+        logger.exception('Email sending failed')
+        return False
+
+
 def deliver(user, purpose, code):
     """Send the code by email (if the user has one) and by SMS. Never raises."""
     if not code:
@@ -147,14 +187,10 @@ def deliver(user, purpose, code):
         return
 
     if user.email:
-        try:
-            send_mail(
-                subject=f"Murang'a e-Citizen: your code is {code}",
-                message=f'{text}\n\nOr open this link:\n{link}',
-                from_email=None,  # uses DEFAULT_FROM_EMAIL
-                recipient_list=[user.email],
-            )
-        except Exception:
-            logger.exception('Email sending failed')
+        send_email(
+            user.email,
+            f"Murang'a e-Citizen: your code is {code}",
+            f'{text}\n\nOr open this link:\n{link}',
+        )
 
     send_sms(getattr(user, 'phone_number', ''), text)
