@@ -49,8 +49,14 @@ THIRD_PARTY_APPS = [
     "auditlog",
 ]
 
-# Add YOUR OWN apps here, e.g. "accounts", "issues", "notifications"
+# All Django apps live under apps/. Each apps.py must have name = "apps.<folder>".
 LOCAL_APPS = [
+    "apps.users",
+    "apps.categories",
+    "apps.service_requests",
+    "apps.announcements",
+    "apps.notifications",
+    "apps.audit_logs",
 ]
 
 INSTALLED_APPS = DJANGO_APPS + THIRD_PARTY_APPS + LOCAL_APPS
@@ -116,9 +122,7 @@ DATABASES = {
 }
 
 # ---------------------------------------------------------------- Auth
-# If you have a custom user model (you probably do, since login uses
-# phone_number), uncomment and set the correct "app_label.ModelName":
-# AUTH_USER_MODEL = "accounts.User"
+AUTH_USER_MODEL = "users.User"
 
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.UserAttributeSimilarityValidator"},
