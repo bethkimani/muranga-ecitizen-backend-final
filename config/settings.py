@@ -32,6 +32,16 @@ RENDER_EXTERNAL_HOSTNAME = os.getenv("RENDER_EXTERNAL_HOSTNAME")
 if RENDER_EXTERNAL_HOSTNAME:
     ALLOWED_HOSTS.append(RENDER_EXTERNAL_HOSTNAME)
 
+# Public URL of the frontend. Used to build the links inside verification
+# and password-reset emails. No trailing slash.
+FRONTEND_URL = os.getenv(
+    "FRONTEND_URL",
+    "https://muranga-ecitizen-frontend-final.vercel.app",
+).rstrip("/")
+
+# How long a verification / reset code stays valid (minutes).
+OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "15"))
+
 # ---------------------------------------------------------------- Apps
 DJANGO_APPS = [
     "django.contrib.admin",
@@ -165,6 +175,10 @@ CELERY_TASK_EAGER_PROPAGATES = False  # a failing task must not crash the reques
 # ---------------------------------------------------------------- Africa's Talking (SMS)
 AFRICASTALKING_USERNAME = os.getenv("AFRICASTALKING_USERNAME", "sandbox")
 AFRICASTALKING_API_KEY = os.getenv("AFRICASTALKING_API_KEY", "")
+
+# Aliases so older code that reads AT_* keeps working.
+AT_USERNAME = AFRICASTALKING_USERNAME
+AT_API_KEY = AFRICASTALKING_API_KEY
 
 # ---------------------------------------------------------------- Email (verification codes)
 EMAIL_HOST = os.getenv("EMAIL_HOST", "smtp.gmail.com")

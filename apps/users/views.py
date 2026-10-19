@@ -1,4 +1,7 @@
+import logging
+
 from django.contrib.auth import get_user_model
+from django.db import transaction
 from rest_framework import generics, permissions
 from rest_framework.response import Response
 from rest_framework.views import APIView
@@ -8,6 +11,7 @@ from apps.users.otp import deliver, issue_code
 from apps.users.serializers import RegisterSerializer, UserSerializer
 
 User = get_user_model()
+logger = logging.getLogger(__name__)
 
 
 class RegisterView(generics.CreateAPIView):
@@ -16,9 +20,17 @@ class RegisterView(generics.CreateAPIView):
     serializer_class = RegisterSerializer
 
     def perform_create(self, serializer):
-        user = serializer.save()
-        code = issue_code(user, 'VERIFY', force=True)
-        deliver(user, 'VERIFY', code)
+        # Create the user and their code together: both succeed or neither does.
+        with transaction.atomic():
+            user = serializer.save()
+            code = issue_code(user, 'VERIFY', force=True)
+
+        # Sending happens after the commit. A failed email/SMS must never
+        # turn a successful registration into a 500.
+        try:
+            deliver(user, 'VERIFY', code)
+        except Exception:
+            logger.exception('Could not deliver verification code for user %s', user.pk)
 
 
 class CurrentUserView(APIView):

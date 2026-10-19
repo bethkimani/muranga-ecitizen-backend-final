@@ -18,11 +18,13 @@ CODE_TTL = timedelta(minutes=getattr(settings, 'OTP_TTL_MINUTES', 15))
 RESEND_COOLDOWN = timedelta(seconds=60)
 MAX_ATTEMPTS = 5
 
-# Next.js pages the email link opens
+# Frontend pages the email link opens
 FRONTEND_PATHS = {
     'VERIFY': '/verify',
     'RESET': '/reset',
 }
+
+DEFAULT_FRONTEND_URL = 'https://muranga-ecitizen-frontend-final.vercel.app'
 
 
 def _hash(user, purpose, code):
@@ -82,13 +84,31 @@ def _to_international(phone):
     return p
 
 
-def send_sms(phone, message):
-    api_key = getattr(settings, 'AT_API_KEY', '') or ''
-    username = getattr(settings, 'AT_USERNAME', 'sandbox') or 'sandbox'
+def _frontend_url():
+    """Frontend base URL without a trailing slash. Never raises if the setting is missing."""
+    url = getattr(settings, 'FRONTEND_URL', '') or DEFAULT_FRONTEND_URL
+    return url.rstrip('/')
 
-    # No real key yet: print to the terminal so you can keep testing
+
+def send_sms(phone, message):
+    if not phone:
+        return False
+
+    # Accept both naming styles so settings.py and .env can use either.
+    api_key = (
+        getattr(settings, 'AFRICASTALKING_API_KEY', '')
+        or getattr(settings, 'AT_API_KEY', '')
+        or ''
+    )
+    username = (
+        getattr(settings, 'AFRICASTALKING_USERNAME', '')
+        or getattr(settings, 'AT_USERNAME', '')
+        or 'sandbox'
+    )
+
+    # No real key yet: log instead of sending so registration still works
     if not api_key or api_key.startswith(('your_', 'PASTE')):
-        print(f'[SMS to {phone}] {message}')
+        logger.warning('[SMS not sent, no API key] to %s: %s', phone, message)
         return False
 
     base = 'api.sandbox.africastalking.com' if username == 'sandbox' else 'api.africastalking.com'
@@ -107,21 +127,24 @@ def send_sms(phone, message):
 
 
 def deliver(user, purpose, code):
-    """Send the code by email (if the user has one) and by SMS."""
+    """Send the code by email (if the user has one) and by SMS. Never raises."""
     if not code:
         return
-    label = 'verify your account' if purpose == 'VERIFY' else 'reset your password'
-    minutes = int(CODE_TTL.total_seconds() // 60)
 
-    who = user.email or user.phone_number
-    link = (
-        f"{settings.FRONTEND_URL}{FRONTEND_PATHS[purpose]}"
-        f"?id={quote(who, safe='')}&code={code}"
-    )
-    text = (
-        f"Your Murang'a e-Citizen code to {label} is {code}. "
-        f"It expires in {minutes} minutes. Do not share it with anyone."
-    )
+    try:
+        label = 'verify your account' if purpose == 'VERIFY' else 'reset your password'
+        minutes = int(CODE_TTL.total_seconds() // 60)
+
+        who = user.email or getattr(user, 'phone_number', '') or ''
+        path = FRONTEND_PATHS.get(purpose, '/verify')
+        link = f"{_frontend_url()}{path}?id={quote(who, safe='')}&code={code}"
+        text = (
+            f"Your Murang'a e-Citizen code to {label} is {code}. "
+            f"It expires in {minutes} minutes. Do not share it with anyone."
+        )
+    except Exception:
+        logger.exception('Could not build verification message')
+        return
 
     if user.email:
         try:
@@ -134,4 +157,4 @@ def deliver(user, purpose, code):
         except Exception:
             logger.exception('Email sending failed')
 
-    send_sms(user.phone_number, text)
+    send_sms(getattr(user, 'phone_number', ''), text)
