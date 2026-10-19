@@ -588,8 +588,16 @@ Add these in the service's **Environment** tab. Your local `.env` is not uploade
 | `DATABASE_URL` | Your Neon connection string |
 | `AT_USERNAME`, `AT_API_KEY` | Africa's Talking credentials |
 | `REDIS_URL` | A hosted Redis URL (only if you use Celery) |
-| `EMAIL_*`, `DEFAULT_FROM_EMAIL` | Same email settings as local |
+| `GMAIL_CLIENT_ID`, `GMAIL_CLIENT_SECRET`, `GMAIL_REFRESH_TOKEN`, `GMAIL_SENDER` | Recommended on Render: Gmail API credentials and the authorized Gmail sender address |
+| `BREVO_API_KEY`, `BREVO_SENDER_EMAIL` | Optional HTTPS email-provider fallback |
+| `EMAIL_*`, `DEFAULT_FROM_EMAIL` | SMTP fallback settings; Render may restrict outbound SMTP, so prefer an HTTPS provider |
 | `FRONTEND_URL` | Your live frontend address (not `localhost`) |
+
+Email delivery is performed before the API request completes so a Render worker
+shutdown cannot discard a daemon-thread send. Configure Gmail API or Brevo
+credentials in Render rather than relying on Django's console backend; with no
+real provider configured, production logs an explicit delivery error instead
+of reporting the email as sent.
 
 Also add the live frontend address to your CORS allowed origins in `settings.py`.
 
