@@ -130,7 +130,7 @@ SIMPLE_JWT = {
 # Trailing slashes are stripped automatically (they break corsheaders.E014).
 CORS_ALLOWED_ORIGINS = env_list(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:3000,http://127.0.0.1:3000,https://muranga-ecitizen-frontend.vercel.app',
+    'http://localhost:3000,http://127.0.0.1:3000,https://muranga-ecitizen-frontend-final.vercel.app/',
 )
 CSRF_TRUSTED_ORIGINS = [o for o in CORS_ALLOWED_ORIGINS if o.startswith('https://')]
 _render_url = os.getenv('RENDER_EXTERNAL_URL')
