@@ -11,6 +11,9 @@ from .serializers import ServiceRequestSerializer
 
 User = get_user_model()
 
+# Kinds of timeline entry an officer can post from the case page.
+UPDATE_KINDS = ('update', 'internal', 'clarification', 'work')
+
 
 class ServiceRequestViewSet(AuditActorMixin, viewsets.ModelViewSet):
     serializer_class = ServiceRequestSerializer
@@ -61,8 +64,25 @@ class ServiceRequestViewSet(AuditActorMixin, viewsets.ModelViewSet):
 
     @action(detail=True, methods=['post'], url_path='assign', permission_classes=[IsAuthenticated, IsDeptHeadOrAdmin])
     def assign(self, request, pk=None):
+        """
+        Routes the request to the department of its category.
+        If 'officer' is given, that officer is assigned as well.
+        If 'officer' is empty, the department head assigns an officer later.
+        """
         obj = self.get_object()
         officer_id = request.data.get('officer')
+
+        if officer_id in (None, ''):
+            obj.assigned_department = obj.category.department
+            obj.save()
+            TimelineEvent.objects.create(
+                request=obj,
+                title='Routed to department',
+                body=f'Routed to {obj.category.department.name}.',
+                author_name=self._author(request.user),
+                kind='status',
+            )
+            return Response(self.get_serializer(obj).data)
 
         try:
             officer = User.objects.get(pk=officer_id, role__in=('STAFF', 'DEPT_HEAD'), is_active=True)
@@ -84,3 +104,25 @@ class ServiceRequestViewSet(AuditActorMixin, viewsets.ModelViewSet):
             kind='status',
         )
         return Response(self.get_serializer(obj).data)
+
+    @action(detail=True, methods=['post'], url_path='updates', permission_classes=[IsAuthenticated, IsStaffRole])
+    def updates(self, request, pk=None):
+        """Adds a public update, internal note, clarification or work record to the timeline."""
+        obj = self.get_object()
+        body = (request.data.get('body') or '').strip()
+        kind = request.data.get('kind') or 'update'
+        title = (request.data.get('title') or 'Official update').strip()
+
+        if len(body) < 5:
+            return Response({'body': 'Write at least 5 characters.'}, status=400)
+        if kind not in UPDATE_KINDS:
+            return Response({'kind': f'Must be one of {list(UPDATE_KINDS)}'}, status=400)
+
+        TimelineEvent.objects.create(
+            request=obj,
+            title=title,
+            body=body,
+            author_name=self._author(request.user),
+            kind=kind,
+        )
+        return Response(self.get_serializer(obj).data, status=201)
