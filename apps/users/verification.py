@@ -8,7 +8,14 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .login import normalize_phone
-from .otp import check_code, deliver, is_otp_required, issue_code, resend_cooldown_seconds
+from .otp import (
+    auto_verify,
+    check_code,
+    deliver,
+    is_otp_required,
+    issue_code,
+    resend_cooldown_seconds,
+)
 
 User = get_user_model()
 logger = logging.getLogger(__name__)
@@ -38,6 +45,10 @@ class SendCodeView(APIView):
 
     def post(self, request):
         if self.purpose == 'VERIFY' and not is_otp_required():
+            # Verification is off: just verify the account so the person can log in.
+            user = find_user(get_identifier(request))
+            if user and user.is_active:
+                auto_verify(user)
             return Response({'detail': 'Account verification is disabled.'})
 
         user = find_user(get_identifier(request))
@@ -69,7 +80,10 @@ class ConfirmVerifyView(APIView):
 
     def post(self, request):
         if not is_otp_required():
-            return Response({'detail': 'Account verification is disabled.'})
+            user = find_user(get_identifier(request))
+            if user and user.is_active:
+                auto_verify(user)
+            return Response({'detail': 'Account verified. You can now log in.'})
 
         identifier = get_identifier(request)
         code = str(request.data.get('code', '')).strip()

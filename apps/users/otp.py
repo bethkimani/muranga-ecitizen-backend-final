@@ -38,8 +38,20 @@ DEFAULT_FRONTEND_URL = 'https://muranga-ecitizen-frontend-final.vercel.app'
 
 
 def is_otp_required():
-    """Return whether account verification OTP is enabled (enabled by default)."""
-    return os.environ.get('OTP_REQUIRED', '1').strip() != '0'
+    """
+    Return whether account verification OTP is enabled.
+
+    DISABLED by default for now. To turn it on later, set the environment
+    variable OTP_REQUIRED=1 on Render.
+    """
+    return os.environ.get('OTP_REQUIRED', '0').strip() == '1'
+
+
+def auto_verify(user):
+    """Mark the account as verified without a code (used while OTP is off)."""
+    if not getattr(user, 'is_phone_verified', False):
+        user.is_phone_verified = True
+        user.save(update_fields=['is_phone_verified'])
 
 
 def _hash(user, purpose, code):
@@ -378,6 +390,15 @@ def _build_html(label, code, minutes, link):
 
 def deliver(user, purpose, code):
     """Send the code by email (if the user has one) and by SMS. Never raises."""
+    # Verification is switched off: verify the account straight away and send nothing.
+    # Password-reset codes are still delivered normally.
+    if purpose == 'VERIFY' and not is_otp_required():
+        try:
+            auto_verify(user)
+        except Exception:
+            logger.exception('Could not auto-verify user %s', getattr(user, 'pk', None))
+        return
+
     if not code:
         return
 
