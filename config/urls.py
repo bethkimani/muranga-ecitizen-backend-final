@@ -116,5 +116,8 @@ urlpatterns = [
         name='auth_change_password',
     ),
 
+    # NEW: admin-only add/edit of departments and categories
+    path('api/manage/', include('apps.categories.manage')),
+
     path('api/', include(router.urls)),
 ]
